@@ -7,6 +7,7 @@ import logging
 import warnings
 from .models import ReloadRulesRequest
 from .restrictor import IPRestrictor
+from django.core.exceptions import ImproperlyConfigured
 try:
     from django.utils.deprecation import MiddlewareMixin
 except ImportError:
@@ -23,6 +24,7 @@ class IPRestrictMiddleware(MiddlewareMixin):
     trusted_proxies = None
     allow_proxies = None
     reload_rules = None
+    ignore_paths = None
 
     def __init__(self, *args, **kwargs):
         super(IPRestrictMiddleware, self).__init__(*args, **kwargs)
@@ -32,6 +34,8 @@ class IPRestrictMiddleware(MiddlewareMixin):
         self.ignore_proxy_header = bool(get_setting('IPRESTRICT_IGNORE_PROXY_HEADER', 'IGNORE_PROXY_HEADER', False))
         self.trust_all_proxies = bool(get_setting('IPRESTRICT_TRUST_ALL_PROXIES', 'TRUST_ALL_PROXIES', False))
 
+        # NEW: exact paths to skip restriction check
+        self.ignore_paths = load_ignore_paths()
     def process_request(self, request):
         if self.reload_rules:
             self.reload_rules_if_needed()
@@ -39,9 +43,25 @@ class IPRestrictMiddleware(MiddlewareMixin):
         url = request.path_info
         client_ip = self.extract_client_ip(request)
 
+        # NEW: if the request path is whitelisted, skip only the restriction check
+        if self.is_ignored_path(url):
+            return
         if self.restrictor.is_restricted(url, client_ip):
             logger.warn("Denying access of %s to %s" % (url, client_ip))
             raise exceptions.PermissionDenied
+
+    def is_ignored_path(self, url):
+        if not self.ignore_paths:
+            return False
+
+        # Exact match
+        if url in self.ignore_paths:
+            return True
+
+        # Optional convenience: treat "/x" and "/x/" as equivalent
+        if url.endswith('/'):
+            return url[:-1] in self.ignore_paths
+        return (url + '/') in self.ignore_paths
 
     def extract_client_ip(self, request):
         client_ip = request.META['REMOTE_ADDR']
@@ -89,7 +109,31 @@ def get_reload_rules_setting():
 
 
 def warn_about_changed_setting(old_name, new_name):
-    # DeprecationWarnings are ignored by default, so lets make sure that
-    # the warnings are shown by using the default UserWarning instead
-    warnings.warn("The setting name '%s' has been deprecated and it will be removed in a future version. "
-                  "Please use '%s' instead." % (old_name, new_name))
+    warnings.warn(
+        "The setting name '%s' has been deprecated and it will be removed in a future version. "
+        "Please use '%s' instead." % (old_name, new_name)
+    )
+
+def load_ignore_paths():
+    """
+    NEW:
+    Setting: IPRESTRICT_IGNORE_PATHS
+    Value: list/tuple of exact request.path_info strings (e.g. "/healthz/" or "/metrics")
+    """
+    paths = get_setting('IPRESTRICT_IGNORE_PATHS', 'IGNORE_PATHS', [])
+    if not paths:
+        return set()
+
+    if not isinstance(paths, (list, tuple, set)):
+        raise ImproperlyConfigured("IPRESTRICT_IGNORE_PATHS must be a list/tuple/set of path strings")
+
+    cleaned = set()
+    for p in paths:
+        if not isinstance(p, str):
+            raise ImproperlyConfigured("IPRESTRICT_IGNORE_PATHS items must be strings; got %r" % (p,))
+        if not p.startswith('/'):
+            # enforce Django-like path shape
+            p = '/' + p
+        cleaned.add(p)
+
+    return cleaned
