@@ -37,15 +37,17 @@ class IPRestrictMiddleware(MiddlewareMixin):
         # NEW: exact paths to skip restriction check
         self.ignore_paths = load_ignore_paths()
     def process_request(self, request):
+        url = request.path_info
+
+        # NEW: if the request path is whitelisted, skip any iprestrict work (incl. reload_rules DB check)
+        if self.is_ignored_path(url):
+            return
+
         if self.reload_rules:
             self.reload_rules_if_needed()
 
-        url = request.path_info
         client_ip = self.extract_client_ip(request)
 
-        # NEW: if the request path is whitelisted, skip only the restriction check
-        if self.is_ignored_path(url):
-            return
         if self.restrictor.is_restricted(url, client_ip):
             logger.warn("Denying access of %s to %s" % (url, client_ip))
             raise exceptions.PermissionDenied
